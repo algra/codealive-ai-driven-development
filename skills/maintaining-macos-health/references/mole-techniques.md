@@ -10,6 +10,7 @@ Mole (`mo`, github.com/tw93/mole) is the safety-floor tool. Its bash modules imp
 - [Tier classification](#tier-classification-moles-mental-model)
 - [Operational logging](#operational-logging)
 - [Mole commands worth remembering](#mole-specific-commands-worth-remembering)
+- [Capturing dry-run output safely](#capturing-dry-run-output-safely)
 - [Anti-patterns Mole avoids](#anti-patterns-mole-avoids-and-why)
 - [Integration recipe](#integration-recipe-when-running-shell-commands-hand-rolled)
 
@@ -153,6 +154,32 @@ Adopt the same pattern for hand-rolled cleanups. It's the audit trail when "what
 | `mo installer` | Find and remove .dmg/.pkg/.zip installers |
 | `mo optimize` | Rebuild system DBs, reset services (use sparingly) |
 | `mo --whitelist` | Manage protected paths (user-additions to never-touch list) |
+
+## Capturing dry-run output safely
+
+`mo clean --dry-run` and `mo purge --dry-run --debug` produce hundreds-to-thousands of lines (e.g. recursive `__pycache__` walks across `google-cloud-sdk`).
+
+**Never pipe them through `head`.** `head` closes the pipe after N lines, mole hits `SIGPIPE` on its next write, and the process exits **144** (`128 + 16 = SIGPIPE`). The crucial total/summary line printed at the very end is also lost.
+
+Three correct patterns, in order of preference:
+
+```bash
+# 1. Capture to a file, then inspect — preserves the full log + summary.
+mo clean --dry-run > /tmp/mole-clean.log 2>&1
+tail -20 /tmp/mole-clean.log                    # summary
+grep -E "would clean|dry$" /tmp/mole-clean.log  # findings
+
+# 2. Pipe through `tail` instead — tail does NOT close stdin early, so no SIGPIPE.
+mo clean --dry-run 2>&1 | tail -200
+
+# 3. For `mo purge --debug`, read the auto-saved log directly:
+mo purge --dry-run --debug > /dev/null 2>&1
+grep -E "Would remove" ~/Library/Logs/mole/mole_debug_session.log \
+  | sed -E 's/.*\* (.+), ([0-9.]+[KMG]B), ([0-9]+) days old.*/\2 | \3d | \1/' \
+  | head -25                                    # safe: input file is finite
+```
+
+The `head` operator is only safe on a **bounded** input (a file or a finished pipeline). For a live mole process, `head` is a SIGPIPE trap.
 
 ## Anti-patterns Mole avoids (and why)
 

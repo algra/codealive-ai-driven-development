@@ -1,6 +1,7 @@
 ---
 name: maintaining-macos-health
-description: Hands-on playbook for macOS disk cleanup, dev-machine optimization, and proactive health alerting. Use when the Mac is full or slow, when a kernel panic / watchdog timeout / vm-compressor-space-shortage / Jetsam event happened, when the user asks to free disk space, audit storage, set up disk/memory alerts, or restore the same monitoring on a new Mac. Built around Mole (`mo` CLI) for safety guards plus a custom LaunchAgent-based alerter for active warnings. Covers Apple Silicon laptops with heavy AI/Docker workloads.
+version: 1.0.0
+description: Hands-on playbook for macOS disk cleanup, dev-machine optimization, and proactive health alerting. Use when the Mac is full or slow, when a kernel panic / watchdog timeout / vm-compressor-space-shortage / Jetsam event happened, when the user asks to free disk space, audit storage, set up disk/memory alerts, or restore the same monitoring on a new Mac. Built around Mole (`mo` CLI) for safety guards plus a custom LaunchAgent-based alerter for active warnings. Covers Apple Silicon laptops with heavy AI/Docker workloads. Not for general macOS support, hardware diagnostics, networking issues, GUI / window-manager bugs, Time Machine recovery, broken app installs, or app-specific performance problems unrelated to disk or memory pressure.
 ---
 
 # Maintaining macOS Health
@@ -45,6 +46,8 @@ Trigger on any of:
 | `assets/mac-health-check` | Production-ready bash script (~250 lines, bash 3.2 compatible) |
 | `assets/com.local.mac-health-check.plist` | LaunchAgent plist with `StartCalendarInterval` (StartInterval is broken on laptops) |
 | `assets/config.sh` | Default config with safe thresholds |
+| `assets/render-cleanup-plan.py` | Interactive HTML cleanup-plan UI. Renders categorised checkboxes from a JSON of scan findings, serves on `127.0.0.1:18347`, opens browser, waits for the user's selection, writes it to `/tmp/cleanup-selection-<ts>.json`. Used by Workflow A. |
+| `assets/apply-cleanup-selection.py` | The **only sanctioned way** to apply a cleanup selection. Reads `selected_items` from a selection JSON and executes each item's `command` field. Enforces protected-override check + path validation + Mole-compatible operations log. Prevents drift between what the user picked and what gets deleted. Supports `--dry-run`. |
 
 Read the relevant reference before acting. Do NOT operate from memory of these files — the details are calibrated to a real incident and small changes break safety.
 
@@ -61,10 +64,23 @@ Read the relevant reference before acting. Do NOT operate from memory of these f
 
 1. **Triage** — read `references/triage.md`, identify which signal fired and how urgent.
 2. **Snapshot baseline** — `df -h /System/Volumes/Data` and write down free GB.
-3. **Tier 1 → 4** sweep — copy from `references/cleanup-tiers.md`. Each tier ends with a `df` checkpoint.
-4. **Run `mo purge`** if dev projects exist. Mole's marker-based detection + bin/.NET guard + vendor/PHP guard makes it safer than hand-rolled `find`.
-5. **`mo clean --dry-run`** for cache categories Mole knows about. Show user before confirming.
-6. **Stop at goal** — most users target 100 GB free. Don't go below that just for sport.
+3. **Run all scans, don't delete yet** — `du` audit of `$HOME` subdirs, `mo clean --dry-run`, `mo purge --dry-run --debug`, `docker system df -v`, `~/Downloads` audit. Capture everything; **deletion comes only after user picks via the UI**.
+4. **Resolve unknown items before building JSON** — for every candidate > 500 MB whose purpose you cannot explain in one sentence (unfamiliar app, unfamiliar bundle ID, unfamiliar dotfolder, vendor-specific cache, ML model weights, VM image, etc.), **research it first**: check `references/never-touch.md` for a known entry, then delegate a quick lookup to the `web-searcher` subagent ("what is `<path or bundle id>` on macOS, is it safe to delete in 2026"). Wait for the answer, then write a concrete `description` (1-3 sentences in the user's language) into the item — *what it is*, *who created it*, *what feature uses it*, *what breaks if deleted*, *whether it auto-recreates*. **Never show the report with vague placeholders like "unknown" or "ML data"** — that defeats the point of the UI. If a web lookup contradicts `never-touch.md`, prefer the web answer (it's fresher) and propose an update to the reference file.
+5. **Build the data JSON** — every candidate becomes a structured `item` (id, label, path, size_bytes, age_days, kind, command, **mandatory `description`**, optional `protected` + `warning`). Write to `/tmp/cleanup-data-<ts>.json`. Use schema from `assets/render-cleanup-plan.py` docstring.
+6. **Render and open the cleanup UI**:
+   ```bash
+   python3 .../assets/render-cleanup-plan.py /tmp/cleanup-data-<ts>.json
+   ```
+   The script starts a one-shot HTTP server on `127.0.0.1:18347`, opens the page in the user's default browser, and **blocks** until the user clicks Submit or Cancel. On submit it writes `/tmp/cleanup-selection-<ts>.json` and prints that path to stdout. Tell the user out loud: "браузер открыт — поставь галочки, нажми Submit, потом пингани меня". Then **stop and wait**.
+7. **After the user pings** — read the selection JSON, render the user's choices back in chat (categories, item list, total GB, any protected overrides flagged ⚠), and **ask one explicit confirmation** before deleting. Don't run anything until they say "go".
+8. **Apply via the helper script — never hand-rolled `rm`**:
+   ```bash
+   python3 .../assets/apply-cleanup-selection.py /tmp/cleanup-selection-<ts>.json
+   ```
+   The script reads `selected_items` from the selection JSON and executes each item's `command` field, with built-in safeguards: protected items must appear in `protected_overrides` or are skipped; commands are validated against a hard-protected path list and a `..`-component check before execution; every action is logged to `~/.config/mole/operations.log` in Mole-compatible TSV. `--dry-run` previews without executing. **Do not write your own `rm` blocks in the apply phase** — that's how you delete items the user explicitly unchecked. The selection JSON is the single source of truth; if it's not in `selected_items`, it does not get deleted. Run `df -h /System/Volumes/Data` before and after for the user-visible delta.
+9. **Stop at goal** — most users target 100 GB free. Don't go below that just for sport.
+
+The Python script is bash-3.2-friendly, uses only stdlib, and is safe to run from inside the agent's shell. Hard-protected items (per `references/never-touch.md`) must always appear in the UI with `"protected": true` + a concrete `warning` string — the UI dims them and requires a per-item confirm dialog before they can be checked. **Never** omit a protected item that user data depends on (Telegram tdata, Bear database, password-manager containers, etc.) — visibility teaches the user the surrounding risk.
 
 ### B. "Set up alerting" (new machine or first time)
 
@@ -100,6 +116,7 @@ Read `references/alerting.md` § Troubleshooting. Common causes:
 5. **For sudo cleanup of `/Library`, `/private/var/db/*`**: only the allowlisted subpaths from `references/never-touch.md` § Sudo allowlist.
 6. **No auto-cleanup hooks tied to alerts.** Alerts notify; user decides. Documented anti-pattern (Google SRE, also confirmed by community 2025-2026 — see `references/alerting.md`).
 7. **Don't delete swap files.** `rm /private/var/vm/swapfile*` while running = guaranteed kernel panic.
+8. **Apply phase reads only the selection JSON.** Never hand-roll `rm` blocks or hard-code paths from the earlier scan when applying. Real incident: agent applied the default-selected recordings list from the original scan, ignoring that the user had unchecked them in the UI before submitting. The fix is structural — use `assets/apply-cleanup-selection.py` which iterates `selected_items` from the selection JSON only.
 
 ## Domain quirks captured
 
@@ -111,6 +128,8 @@ Read `references/alerting.md` § Troubleshooting. Common causes:
 - `log show --last 6m` is too slow (30+ s) for periodic checks. Poll `/Library/Logs/DiagnosticReports/JetsamEvent-*.ips` instead — async write delay is acceptable on a 5-min cadence.
 - `JetsamEvent-*.ips` files live in `/Library/Logs/DiagnosticReports/` (system-wide), NOT `~/Library/Logs/DiagnosticReports/`.
 - APFS purgeable space lags behind actual deletion by minutes. After cleanup, `df` may not show the change immediately; wait or run `diskutil info /System/Volumes/Data | grep "Container Free"`.
+- **Claude Desktop `vm_bundles/claudevm.bundle/` is Claude Cowork**, not "Claude Code sandbox" — it's a ~10 GB Ubuntu VM image (`rootfs.img`, `sessiondata.img`, `efivars.fd`, `vmIP`) for Anthropic's sandboxed code-execution feature. It is **auto-provisioned at every Claude Desktop launch** via an SHA1 integrity check, so its recent mtime ≠ user activity. Technically safe to delete (no chat/MCP impact), but Claude Desktop **silently re-downloads ~10 GB on next launch** and runs at ~55 % CPU while doing so. The Claude Code CLI does NOT use this bundle. Recommended classification: Tier 10 discuss-first with quit-Claude-Desktop pre-step and a warning that the bundle returns until Anthropic ships an opt-out toggle (open in [anthropics/claude-code#57371](https://github.com/anthropics/claude-code/issues/57371)).
+- **General rule**: if you encounter a folder/bundle you can't describe in one sentence (especially > 500 MB), don't guess — delegate a quick lookup to the `web-searcher` subagent before writing the item's `description`. See Workflow A step 4.
 
 ## Outcomes scale
 
